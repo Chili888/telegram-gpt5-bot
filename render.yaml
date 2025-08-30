@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: telegram-gpt5-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5
+      - key: WEBHOOK_SECRET
+        value: your-webhook-secret      # 自定义个复杂的
+      - key: TIMEOUT_SEC
+        value: "60"
