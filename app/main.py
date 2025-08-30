@@ -61,13 +61,8 @@ async def healthz():
 
 @app.post(f"/webhook/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
-    """
-    Telegram 将所有 Update POST 到这里。
-    仅处理 text 消息；其他类型直接忽略。
-    """
-    update: Dict[str, Any] = await request.json()
-
-    # 兼容 message / edited_message / channel_post
+    update = await request.json()
+    print("UPDATE >>>", update)  # 打印整包，方便在 Render Logs 里看
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
     if not msg:
         return PlainTextResponse("ok")  # 忽略非文本更新
@@ -77,25 +72,26 @@ async def telegram_webhook(request: Request):
     text = msg.get("text")
     message_id = msg.get("message_id")
 
-    if not text or chat_id is None:
+    # 如果不是文本，给个兜底回复，避免“不可访问消息”困惑
+    if not text:
+        await tg_send_message(chat_id, "我目前只支持文字消息～", reply_to=message_id if message_id else None)
         return PlainTextResponse("ok")
 
-    # /start 简单欢迎
     if text.strip().lower() == "/start":
         await tg_send_message(chat_id, "✅ 你好！我是 GPT-5 机器人，直接发消息和我对话吧～")
         return PlainTextResponse("ok")
 
-    # 构造对话消息（可根据需要加入会话记忆/数据库）
+    # 调 OpenAI
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": text},
     ]
-
     try:
         reply = await openai_chat(messages)
-    except httpx.HTTPError as e:
+    except Exception as e:
         await tg_send_message(chat_id, f"❌ OpenAI 调用失败：{e}", reply_to=message_id)
         return PlainTextResponse("ok")
 
     await tg_send_message(chat_id, reply, reply_to=message_id)
     return PlainTextResponse("ok")
+
