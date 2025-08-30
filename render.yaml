@@ -13,6 +13,7 @@ services:
       - key: OPENAI_MODEL
         value: gpt-5
       - key: WEBHOOK_SECRET
-        value: your-webhook-secret      # 自定义个复杂的
+        value: dev-secret      # 自定义个复杂的
       - key: TIMEOUT_SEC
         value: "60"
+
