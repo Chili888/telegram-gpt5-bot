@@ -12,26 +12,26 @@ from fastapi.responses import PlainTextResponse
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-5")
+
+# 默认使用 gpt-4o-mini（对所有账号可用）
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "dev-secret")
 TIMEOUT_SEC     = int(os.getenv("TIMEOUT_SEC", "60"))
 
-# 并发/防抖配置（可按需在 Render 环境变量里覆盖）
-OPENAI_MAX_CONCURRENCY = int(os.getenv("OPENAI_MAX_CONCURRENCY", "2"))  # 同时最多多少请求打到 OpenAI
-CHAT_COOLDOWN_SEC      = float(os.getenv("CHAT_COOLDOWN_SEC", "1.2"))   # 同一 chat 最短间隔（秒）
+# 并发/防抖配置
+OPENAI_MAX_CONCURRENCY = int(os.getenv("OPENAI_MAX_CONCURRENCY", "2"))
+CHAT_COOLDOWN_SEC      = float(os.getenv("CHAT_COOLDOWN_SEC", "1.2"))
 
 # ================== 常量与客户端 ==================
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SYSTEM_PROMPT = (
-    "You are ChatGPT (GPT-5). Be concise, helpful, and safe. "
+    "You are ChatGPT. Be concise, helpful, and safe. "
     "Respond in the same language the user used."
 )
 
-# 全局 httpx 客户端（注意：Render 单实例复用）
 client = httpx.AsyncClient(timeout=TIMEOUT_SEC)
-# OpenAI 并发闸
 _openai_sema = asyncio.Semaphore(OPENAI_MAX_CONCURRENCY)
-# chat 防抖
 _last_call_ts: dict[int, float] = {}
 
 app = FastAPI()
@@ -48,20 +48,13 @@ async def tg_send_message(chat_id: int, text: str, reply_to: int | None = None):
 
 
 async def openai_chat(messages: List[dict[str, str]]) -> str:
-    """
-    调用 OpenAI Chat Completions，内置并发限流 + 429/503 退避重试。
-    """
     url = f"{OPENAI_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    body = {
-        "model": OPENAI_MODEL,
-        "messages": messages,
-        "temperature": 0.7,
-    }
+    body = {"model": OPENAI_MODEL, "messages": messages, "temperature": 0.7}
 
-    async with _openai_sema:  # 全局并发控制
-        delay = 1.0  # 指数退避起始秒
-        for attempt in range(5):  # 最多重试 5 次
+    async with _openai_sema:
+        delay = 1.0
+        for attempt in range(5):
             try:
                 resp = await client.post(url, headers=headers, json=body)
                 resp.raise_for_status()
@@ -69,7 +62,6 @@ async def openai_chat(messages: List[dict[str, str]]) -> str:
                 return data["choices"][0]["message"]["content"]
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
-                # 429/503：优先读取 Retry-After，否则指数退避
                 if status in (429, 503):
                     ra = e.response.headers.get("retry-after")
                     wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else delay
@@ -77,15 +69,12 @@ async def openai_chat(messages: List[dict[str, str]]) -> str:
                     await asyncio.sleep(wait)
                     delay = min(delay * 2, 20.0)
                     continue
-                # 401/403 基本是 Key/权限问题，直接抛出
                 raise
             except httpx.HTTPError:
-                # 网络瞬断也退避重试
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 20.0)
                 continue
 
-        # 超过最大重试仍失败
         raise httpx.HTTPError("OpenAI服务繁忙，请稍后再试")
 
 
@@ -94,7 +83,6 @@ async def openai_chat(messages: List[dict[str, str]]) -> str:
 async def healthz():
     return PlainTextResponse("ok")
 
-# 根路径给 200，避免 404 误会
 @app.get("/")
 async def root():
     return PlainTextResponse("ok")
@@ -103,12 +91,7 @@ async def root():
 # ================== Telegram Webhook ==================
 @app.post(f"/webhook/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
-    """
-    Telegram 将 Update POST 到这里。
-    仅处理文本；非文本给友好提示。
-    """
     update: Dict[str, Any] = await request.json()
-    # 打印一份到日志，利于 Render Logs 调试
     print("UPDATE >>>", update)
 
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
@@ -120,18 +103,16 @@ async def telegram_webhook(request: Request):
     text = msg.get("text")
     message_id = msg.get("message_id")
 
-    # 非文本类型兜底
     if not text:
         if chat_id is not None:
             await tg_send_message(chat_id, "我目前只支持文字消息～", reply_to=message_id)
         return PlainTextResponse("ok")
 
-    # /start 欢迎
     if text.strip().lower() == "/start":
-        await tg_send_message(chat_id, "✅ 你好！我是 GPT-5 机器人，直接发消息和我对话吧～")
+        await tg_send_message(chat_id, "✅ 你好！我是 GPT-机器人，直接发消息和我对话吧～")
         return PlainTextResponse("ok")
 
-    # ===== 每 chat 防抖（避免同一人连续触发 429）=====
+    # 防抖：避免同一 chat 瞬间多次触发
     now = time.time()
     last = _last_call_ts.get(chat_id, 0.0)
     if now - last < CHAT_COOLDOWN_SEC:
@@ -139,7 +120,6 @@ async def telegram_webhook(request: Request):
         return PlainTextResponse("ok")
     _last_call_ts[chat_id] = now
 
-    # 构造最小 messages；需要上下文记忆可在这里拼接历史
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": text},
@@ -152,7 +132,7 @@ async def telegram_webhook(request: Request):
         if e.response.status_code == 429:
             await tg_send_message(chat_id, "⚠️ OpenAI 限流啦，我会自动重试；如果仍失败请稍后再试～", reply_to=message_id)
         elif e.response.status_code in (401, 403):
-            await tg_send_message(chat_id, "❌ OpenAI API 权限或密钥错误，请检查 OPENAI_API_KEY / 模型权限。", reply_to=message_id)
+            await tg_send_message(chat_id, "❌ OpenAI API Key 错误或无权限，请检查。", reply_to=message_id)
         else:
             await tg_send_message(chat_id, f"❌ OpenAI 错误：{e.response.status_code}", reply_to=message_id)
     except httpx.HTTPError as e:
