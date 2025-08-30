@@ -14,7 +14,7 @@ OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 # 默认使用 gpt-4o-mini（对所有账号可用）
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
 WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "dev-secret")
 TIMEOUT_SEC     = int(os.getenv("TIMEOUT_SEC", "60"))
@@ -139,3 +139,4 @@ async def telegram_webhook(request: Request):
         await tg_send_message(chat_id, f"❌ 网络异常：{e}", reply_to=message_id)
 
     return PlainTextResponse("ok")
+
