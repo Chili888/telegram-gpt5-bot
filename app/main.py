@@ -28,7 +28,8 @@ HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS", "16000"))
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SYSTEM_PROMPT = (
     "You are ChatGPT with real-time browsing ability. "
-    "Always use the latest search results provided to you. "
+    "You MUST always base your answers ONLY on the search results provided. "
+    "If no search results are available, reply '未找到最新相关信息'. "
     "Respond in the same language as the user."
 )
 
@@ -37,7 +38,6 @@ _openai_sema = asyncio.Semaphore(OPENAI_MAX_CONCURRENCY)
 _last_call_ts: Dict[str, float] = {}
 
 # ================== 会话存储 ==================
-# chat_id:user_id -> deque of {role, content, ts}
 _conversations: Dict[str, Deque[Dict[str, Any]]] = {}
 
 def _conv_key(chat_id: int, user_id: int) -> str:
@@ -57,7 +57,6 @@ def _append_history(chat_id: int, user_id: int, role: str, content: str):
     })
 
 def _build_messages(chat_id: int, user_id: int, user_text: str, search_results: str) -> List[Dict[str, str]]:
-    # 只保留 24 小时内的历史
     hist = [m for m in _get_history(chat_id, user_id) if time.time() - m.get("ts", 0) < 86400]
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -128,7 +127,7 @@ async def search_web(query: str) -> str:
             title = item.get("title", "")
             link = item.get("link", "")
             snippet = item.get("snippet", "")
-            results.append(f"- {title}\n{snippet}\n{link}")
+            results.append(f"▪️ {title}\n{snippet}\n{link}")
         return "\n\n".join(results) if results else "未找到相关搜索结果"
     except Exception as e:
         return f"❌ 搜索失败: {e}"
@@ -214,9 +213,11 @@ async def telegram_webhook(request: Request):
             if last_user:
                 search_query = last_user[0] + " " + text
 
+    # 先搜索 → 直接返回原始结果给用户
     search_results = await search_web(search_query)
+    await tg_send_message(chat_id, f"🔎 最新搜索结果:\n\n{search_results}", reply_to=message_id)
 
-    # 构造上下文
+    # 构造上下文（带搜索结果 → GPT 总结）
     messages = _build_messages(chat_id, user_id, text, search_results)
 
     try:
