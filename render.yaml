@@ -1,16 +1,72 @@
 services:
   - type: web
-    name: telegram-gpt5-bot
+    name: gpt-telegram-bot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000
+    plan: free            # 可改：free / starter / standard / pro
+    region: singapore     # 可改：oregon / frankfurt / singapore / virginia
+    autoDeploy: true
+    healthCheckPath: /healthz
+
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+
+    startCommand: |
+      uvicorn main:app --host 0.0.0.0 --port $PORT
+
     envVars:
+      # —— 必填（Dashboard中填值，避免写到repo）——
       - key: BOT_TOKEN
         sync: false
       - key: OPENAI_API_KEY
         sync: false
       - key: SERPAPI_KEY
         sync: false
+
+      # —— 建议/可选 —— 
       - key: WEBHOOK_SECRET
-        sync: false
-        
+        value: mysecret123
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: OPENAI_MODEL
+        value: gpt-4o
+      - key: TIMEOUT_SEC
+        value: "60"
+      - key: OPENAI_MAX_CONCURRENCY
+        value: "2"
+      - key: CHAT_COOLDOWN_SEC
+        value: "1.2"
+
+      # 24小时上下文
+      - key: HISTORY_MAX_TURNS
+        value: "12"
+      - key: HISTORY_LIFESPAN_SEC
+        value: "86400"
+
+      # 回答详细度与长度
+      - key: DETAIL_LEVEL
+        value: deep          # brief / standard / deep
+      - key: MAX_TOKENS
+        value: "1400"
+      - key: STRICT_MODEL
+        value: "1"           # 1=固定用 OPENAI_MODEL，不降级
+
+      # 搜索厚度与时效
+      - key: SEARCH_MAX_ORGANIC
+        value: "8"
+      - key: SEARCH_MAX_NEWS
+        value: "5"
+      - key: SEARCH_RECENCY
+        value: w             # 近一周；可空/ h / d / w / m
+      - key: SEARCH_HL
+        value: zh-cn
+      - key: SEARCH_GL
+        value: us
+
+      # 输出与渲染
+      - key: TELEGRAM_PARSE_MODE
+        value: HTML
+      - key: DISABLE_LINK_PREVIEW
+        value: "1"
+      - key: SANITIZE_OUTPUT
+        value: "1"
