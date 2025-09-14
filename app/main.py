@@ -338,32 +338,47 @@ async def telegram_webhook(request: Request):
         return PlainTextResponse("ok")
 
     # 每 chat 防抖
-now = time.time()
-if now - _last_call_ts.get(chat_id, 0.0) < CHAT_COOLDOWN_SEC:
-    await tg_send_message(chat_id, "我正在处理上一条消息，请稍等片刻～", reply_to=message_id)
-    return PlainTextResponse("ok")
-_last_call_ts[chat_id] = now
+        # 每 chat 防抖
+    now = time.time()
+    if now - _last_call_ts.get(chat_id, 0.0) < CHAT_COOLDOWN_SEC:
+        await tg_send_message(chat_id, "我正在处理上一条消息，请稍等片刻～", reply_to=message_id)
+        return PlainTextResponse("ok")
+    _last_call_ts[chat_id] = now
 
-# === 默认走联网搜索（ALWAYS_WEB=1 时生效） ===
-if ALWAYS_WEB:
-    await tg_send_message(chat_id, "🔎 正在联网搜索，请稍候…", reply_to=message_id)
-    reply = await web_answer(text)  # 使用你前面实现的联网模块
-    # 如果搜索不可用或抓取失败，web_answer 会返回以“❌ …”开头的提示
-    if not reply.startswith("❌"):
-        await tg_send_message(chat_id, reply)
+    # === 默认走联网搜索（需要 ALWAYS_WEB=1） ===
+    if ALWAYS_WEB:
+        await tg_send_message(chat_id, "🔎 正在联网搜索，请稍候…", reply_to=message_id)
+        reply = await web_answer(text)
+        # 联网成功就直接返回；失败（返回以“❌”开头）再回落到本地对话
+        if not reply.startswith("❌"):
+            await tg_send_message(chat_id, reply)
+            _append_history(chat_id, "user", text)
+            _append_history(chat_id, "assistant", reply)
+            return PlainTextResponse("ok")
+
+    # === 回落：直接用模型（带历史） ===
+    messages = _build_messages(chat_id, text)
+    try:
+        reply = await openai_chat(messages)
+        await tg_send_message(chat_id, reply, reply_to=message_id)
         _append_history(chat_id, "user", text)
         _append_history(chat_id, "assistant", reply)
-        return PlainTextResponse("ok")
-    # 联网失败则继续回落到本地对话
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        if code == 429:
+            await tg_send_message(chat_id, "⚠️ OpenAI 限流（我会退避重试）；若仍失败请稍后再试～", reply_to=message_id)
+        elif code in (401, 403):
+            await tg_send_message(chat_id, "❌ OpenAI API Key 或权限问题，请检查 OPENAI_API_KEY / 模型权限。", reply_to=message_id)
+        elif code in (400, 404):
+            await tg_send_message(chat_id, "❌ 目标模型不可用（已尝试自动切换）。请稍后重试。", reply_to=message_id)
+        else:
+            await tg_send_message(chat_id, f"❌ OpenAI 错误：HTTP {code}", reply_to=message_id)
+    except httpx.HTTPError as e:
+        await tg_send_message(chat_id, f"❌ 网络异常：{e}", reply_to=message_id)
+    except Exception as e:
+        await tg_send_message(chat_id, f"❌ 未知错误：{e}", reply_to=message_id)
 
-# === 回落：直接用模型（带历史） ===
-messages = _build_messages(chat_id, text)
-try:
-    reply = await openai_chat(messages)
-    await tg_send_message(chat_id, reply, reply_to=message_id)
-    _append_history(chat_id, "user", text)
-    _append_history(chat_id, "assistant", reply)
-except httpx.HTTPStatusError as e:
+    return PlainTextResponse("ok")
         # 写入历史
         _append_history(chat_id, "user", text)
         _append_history(chat_id, "assistant", reply)
@@ -383,3 +398,4 @@ except httpx.HTTPStatusError as e:
         await tg_send_message(chat_id, f"❌ 未知错误：{e}", reply_to=message_id)
 
     return PlainTextResponse("ok")
+
