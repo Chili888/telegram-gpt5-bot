@@ -72,7 +72,6 @@ _last_search_query: Dict[str, str] = {}
 
 # ================== 会话存储（内存：chat_id:user_id 维度） ==================
 _conversations: Dict[str, Deque[Dict[str, Any]]] = {}
-_session_topic: Dict[str, str] = {}  # 当前会话主体（如“黄仁勋”）
 
 def _conv_key(chat_id: int | str, user_id: int | str) -> str:
     return f"{chat_id}:{user_id}"
@@ -161,44 +160,6 @@ async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = Non
     return r.json()
 
 # ================== 搜索功能（SerpAPI） ==================
-# 规范化查询 + 主体提取
-_CANON = [
-    (re.compile(r"(黄仁勋|黄仁勛|詹森.?黄|Jensen\s*Huang)", re.I), "黄仁勋"),
-    (re.compile(r"(特朗普|川普|Donald\s*Trump|唐纳德.?特朗普)", re.I), "特朗普"),
-    (re.compile(r"(英伟达|NVIDIA)", re.I), "英伟达"),
-    (re.compile(r"(英国|Britain|United\s*Kingdom|U\.?K\.?)", re.I), "英国"),
-]
-
-def _normalize_query(text: str) -> str:
-    q = text.strip()
-    q = re.sub(r"[摇瑶咬](?=拜访)", "将", q)   # “摇/瑶/咬拜访” -> “将拜访”
-    for pat, canon in _CANON:
-        q = pat.sub(canon, q)
-    q = re.sub(r"\s+", " ", q)
-    return q
-
-def _extract_canonical_entity(text: str) -> Optional[str]:
-    for pat, canon in _CANON:
-        if canon in ("黄仁勋", "特朗普") and pat.search(text or ""):
-            return canon
-    for pat, canon in _CANON:
-        if pat.search(text or ""):
-            return canon
-    return None
-
-def build_smart_query(text: str, hist: Deque[Dict[str, Any]], key: str) -> str:
-    raw = text.strip()
-    q = _normalize_query(raw)
-    need_expand = (len(q) <= 8) or re.search(r"\b(他|她|它)\b", q)
-    topic = _session_topic.get(key, "")
-    if need_expand and topic:
-        q = q.replace("他", topic).replace("她", topic).replace("它", topic)
-        if not q.startswith(topic):
-            q = f"{topic} {q}"
-    if re.fullmatch(r"(和|与)?特朗普", q) and topic:
-        q = f"{topic} 特朗普 互动 动态 英国 将拜访"
-    return q
-
 def _format_search_results(data: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]]]:
     results_txt_lines: List[str] = []
     footnotes: List[Tuple[str, str]] = []
@@ -296,12 +257,16 @@ def make_footnotes_html(footnotes: List[Tuple[str, str]]) -> str:
             break
     return "\n" + "\n".join(lines)
 
-def _maybe_update_topic(key: str, user_text: str, search_notes: str, reply_text: str):
-    for s in (user_text, search_notes, reply_text):
-        ent = _extract_canonical_entity(s or "")
-        if ent:
-            _session_topic[key] = ent
-            return
+def build_smart_query(text: str, hist: Deque[Dict[str, Any]], key: str) -> str:
+    """
+    仅做最小上下文补全：若本次消息过短（<=6 字符），拼接上一条用户提问。
+    不做任何人物/地名/关键词的替换或纠错。
+    """
+    t = (text or "").strip()
+    if len(t) > 6:
+        return t
+    last_user = next((m["content"] for m in reversed(hist) if m.get("role") == "user"), "")
+    return (last_user + " " + t).strip() if last_user else t
 
 async def answer_once(chat_id: int, user_id: int, text: str, reply_to: Optional[int]):
     # 限流（每个用户）
@@ -330,7 +295,6 @@ async def answer_once(chat_id: int, user_id: int, text: str, reply_to: Optional[
             await tg_send_message(chat_id, extra)
         _append_history(chat_id, user_id, "user", text)
         _append_history(chat_id, user_id, "assistant", reply_text)
-        _maybe_update_topic(key, text, search_block, reply_text)
     except Exception as e:
         await tg_send_message(chat_id, f"错误: {escape_html(str(e))}", reply_to=reply_to)
 
@@ -372,28 +336,26 @@ async def telegram_webhook(request: Request):
     cmd = text.strip().lower()
     if cmd == "/start":
         tips = (
-            "已开启：自动联网搜索 + 一次性完整回复 + 24小时上下文记忆\n"
-            "输入 /clear 可清空上下文，输入 /status 可查看运行状态"
+            "✅已开启：自动联网搜索 + 一次性完整回复 + 24小时上下文记忆"
         )
         await tg_send_message(chat_id, tips)
         return PlainTextResponse("ok")
 
     if cmd == "/clear":
         _conversations.pop(_conv_key(chat_id, user_id), None)
-        _session_topic.pop(_conv_key(chat_id, user_id), None)
         await tg_send_message(chat_id, "已清空你的上下文")
         return PlainTextResponse("ok")
 
     if cmd == "/status":
         key = _conv_key(chat_id, user_id)
-        topic = _session_topic.get(key, "(未记住主体)")
         serp = "已配置" if SERPAPI_KEY else "未配置"
         model_used = _last_model_used.get(key, "(尚未调用)")
         last_q = _last_search_query.get(key, "(无)")
         await tg_send_message(
             chat_id,
-            f"当前主体：{topic}\nSerpAPI：{serp}\n最近使用模型：{model_used}\n最近搜索词：{last_q}\n"
-            f"记忆窗口：24小时；历史上限：{HISTORY_MAX_TURNS} 轮\n细节级别：{DETAIL_LEVEL}；max_tokens：{MAX_TOKENS}\n"
+            f"SerpAPI：{serp}\n最近使用模型：{model_used}\n最近搜索词：{last_q}\n"
+            f"记忆窗口：24小时；历史上限：{HISTORY_MAX_TURNS} 轮\n"
+            f"细节级别：{DETAIL_LEVEL}；max_tokens：{MAX_TOKENS}\n"
             f"搜索厚度：organic={SEARCH_MAX_ORGANIC}, news={SEARCH_MAX_NEWS}, recency={SEARCH_RECENCY or '不限'}"
         )
         return PlainTextResponse("ok")
