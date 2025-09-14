@@ -22,21 +22,27 @@ TIMEOUT_SEC     = int(os.getenv("TIMEOUT_SEC", "60"))
 OPENAI_MAX_CONCURRENCY = int(os.getenv("OPENAI_MAX_CONCURRENCY", "2"))
 CHAT_COOLDOWN_SEC      = float(os.getenv("CHAT_COOLDOWN_SEC", "1.2"))
 
-HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "12"))      # 提升记忆轮数
-HISTORY_LIFESPAN  = float(os.getenv("HISTORY_LIFESPAN_SEC", "172800"))  # 记忆 48h
-STREAM_REPLY      = os.getenv("STREAM_REPLY", "1") == "1"          # 是否流式编辑输出
-TELEGRAM_PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE", "HTML")     # HTML 渲染更稳
+HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "12"))
+HISTORY_LIFESPAN  = float(os.getenv("HISTORY_LIFESPAN_SEC", "172800"))
+
+STREAM_REPLY      = os.getenv("STREAM_REPLY", "1") == "1"
+TELEGRAM_PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE", "HTML")
 DISABLE_LINK_PREVIEW = os.getenv("DISABLE_LINK_PREVIEW", "1") == "1"
+
+# 新增：更快流式刷新 & 输出净化
+STREAM_EDIT_INTERVAL_MS = int(os.getenv("STREAM_EDIT_INTERVAL_MS", "120"))  # 每次编辑最小间隔（毫秒）
+STREAM_MIN_DELTA_CHARS  = int(os.getenv("STREAM_MIN_DELTA_CHARS", "60"))    # 至少新增多少字符就刷新
+SANITIZE_OUTPUT         = os.getenv("SANITIZE_OUTPUT", "1") == "1"          # 是否清理星号/杂符
 
 # ================== 常量与客户端 ==================
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 SYSTEM_PROMPT = (
     "You are ChatGPT with real-time browsing ability.\n"
-    "You must write concise, helpful answers in the user's language.\n"
-    "When search results are provided, rely on them primarily and synthesize a clear answer.\n"
-    "Cite sources concisely when helpful.\n"
-    "Prefer bullet points, code blocks and examples when applicable.\n"
+    "Use plain sentences with simple punctuation. Do not use bullets, asterisks, Markdown, or emojis unless the user asks.\n"
+    "When search results are provided, rely on them and synthesize a concise answer.\n"
+    "Avoid decorative punctuation and excessive exclamation/question marks.\n"
+    "Respond in the user's language."
 )
 
 client = httpx.AsyncClient(timeout=TIMEOUT_SEC)
@@ -73,7 +79,6 @@ def _build_messages(chat_id: int, user_id: int, user_text: str, search_block: Op
     messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     if search_block:
         messages.append({"role": "system", "content": f"Here are fresh search notes:\n{search_block}"})
-    # 组装最近对话历史（控制字符数）
     total_chars = 0
     acc: List[Dict[str, str]] = []
     for m in reversed(hist):
@@ -95,11 +100,9 @@ def escape_html(s: str) -> str:
     )
 
 def make_safe_html(text: str) -> str:
-    # 只做基础转义，保留用户/模型中的反引号代码块为纯文本显示
     return escape_html(text)
 
 def telegram_split(text: str, limit: int = 4096) -> List[str]:
-    # Telegram 单条消息最大 4096 字符；尽量在段落边界切分
     chunks: List[str] = []
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -110,6 +113,28 @@ def telegram_split(text: str, limit: int = 4096) -> List[str]:
     if text:
         chunks.append(text)
     return chunks
+
+# ================== 输出清理（去星号/项目符号/Markdown符号/重复标点） ==================
+_PUNCT_BULLETS = r"[*•·▪◦◆◇★☆✦✧❖▶►▷◁▸▹◀◁➤➔→⇒➜➤]"
+_MD_MARKS      = r"[`_#>]"
+
+def _sanitize_plain_text(text: str) -> str:
+    # 避免破坏代码块
+    if "```" in text:
+        return text
+
+    # 行首项目符号（- • · * 等）
+    text = re.sub(r"(?m)^\s*[-–—"+_PUNCT_BULLETS+r"]\s+", "", text)
+    # 移除常见 Markdown 符号与项目符号字符
+    text = re.sub(_MD_MARKS, "", text)
+    text = re.sub(_PUNCT_BULLETS, "", text)
+    # 统一引号
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    # 合并重复标点
+    text = re.sub(r"([!！?？.,，。;；:：\-—])\1{1,}", r"\1", text)
+    # 去掉行首多余符号
+    text = re.sub(r"(?m)^[\-\—\·\•\*]+\s*", "", text)
+    return text.strip()
 
 # ================== Telegram 工具 ==================
 async def tg_send_chat_action(chat_id: int, action: str = "typing"):
@@ -145,9 +170,6 @@ async def tg_edit_message(chat_id: int, message_id: int, text: str):
 
 # ================== 搜索功能（SerpAPI） ==================
 def _format_search_results(data: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]]]:
-    """
-    返回 (用于塞给模型的纯文本 block, [(title, url)] 供可选脚注)
-    """
     results_txt_lines: List[str] = []
     footnotes: List[Tuple[str, str]] = []
 
@@ -158,15 +180,11 @@ def _format_search_results(data: Dict[str, Any]) -> Tuple[str, List[Tuple[str, s
         if title and link:
             footnotes.append((title, link))
 
-    # Organic
     for item in data.get("organic_results", [])[:5]:
         add_item(item.get("title", ""), item.get("snippet", ""), item.get("link", ""))
-
-    # News
     for item in data.get("news_results", [])[:3]:
         add_item(item.get("title", ""), item.get("snippet", ""), item.get("link", ""))
 
-    # Answer box
     abox = data.get("answer_box") or {}
     if abox:
         add_item(abox.get("title", "Answer"), abox.get("snippet", "") or abox.get("answer", ""), abox.get("link", ""))
@@ -194,7 +212,6 @@ async def _chat_once(model: str, messages: List[Dict[str, str]], stream: bool = 
 
     async with _openai_sema:
         if not stream:
-            # 普通非流式
             delay = 1.0
             for _ in range(5):
                 try:
@@ -213,7 +230,6 @@ async def _chat_once(model: str, messages: List[Dict[str, str]], stream: bool = 
                     await asyncio.sleep(delay); delay = min(delay * 2, 20.0); continue
             raise httpx.HTTPError("OpenAI 服务繁忙，请稍后再试")
         else:
-            # 流式：返回 async 生成器
             async def gen():
                 delay = 1.0
                 for attempt in range(5):
@@ -242,7 +258,6 @@ async def _chat_once(model: str, messages: List[Dict[str, str]], stream: bool = 
                         raise
                     except httpx.HTTPError:
                         await asyncio.sleep(delay); delay = min(delay * 2, 20.0); continue
-                # 超过重试就结束
                 return
             return gen()
 
@@ -260,7 +275,6 @@ def build_smart_query(text: str, hist: Deque[Dict[str, Any]]) -> str:
     text_strip = text.strip()
     if len(text_strip) >= 6:
         return text_strip
-    # 短语时结合上文
     last_user = next((m["content"] for m in reversed(hist) if m["role"] == "user"), "")
     return (last_user + " " + text_strip).strip() if last_user else text_strip
 
@@ -278,7 +292,7 @@ def make_footnotes_html(footnotes: List[Tuple[str, str]]) -> str:
         url_safe = escape_html(url)
         lines.append(f"[{idx}] <a href=\"{url_safe}\">{title_safe}</a>")
         idx += 1
-        if idx > 6:  # 最多 6 条
+        if idx > 6:
             break
     return "\n" + "\n".join(lines)
 
@@ -303,44 +317,45 @@ async def answer_and_stream(chat_id: int, user_id: int, text: str, reply_to: Opt
     await tg_send_chat_action(chat_id, "typing")
 
     if STREAM_REPLY:
-        # 先发一个占位消息
+        # 占位消息
         placeholder = await tg_send_message(chat_id, "…", reply_to=reply_to)
         message_id = placeholder["result"]["message_id"]
 
         acc = ""
+        buf = ""  # 自上次编辑以来新增的内容
+        edit_interval = max(0.05, STREAM_EDIT_INTERVAL_MS / 1000.0)
+        min_delta = max(10, STREAM_MIN_DELTA_CHARS)
         last_edit = time.monotonic()
-        edit_interval = 0.25      # 250ms 刷新频率
-        max_chunk = 1200          # 累积到一定长度再编辑，减少请求
+
         try:
             stream = await openai_chat(messages, use_stream=True)
             async for delta in stream:
                 acc += delta
-                tnow = time.monotonic()
-                if (tnow - last_edit > edit_interval) or (len(acc) - (len(acc) % max_chunk) != len(acc)):
-                    # 安全 HTML
-                    body = make_safe_html(acc)
-                    # 如果超 4096，切块：前面固定，最后一块可编辑
+                buf += delta
+                now_mono = time.monotonic()
+                if (now_mono - last_edit >= edit_interval) or (len(buf) >= min_delta):
+                    out = _sanitize_plain_text(acc) if SANITIZE_OUTPUT else acc
+                    body = make_safe_html(out)
                     parts = telegram_split(body)
-                    # 先把前面的块发出去，最后一块用于 edit
+
                     if len(parts) > 1:
-                        # 把第一块替换到当前消息
                         await tg_edit_message(chat_id, message_id, parts[0])
-                        # 其余中间块用 sendMessage 发送
                         for mid in parts[1:-1]:
                             sent = await tg_send_message(chat_id, mid)
                             message_id = sent["result"]["message_id"]
-                        # 最后一块回填到最后一条，继续后续编辑
                         await tg_edit_message(chat_id, message_id, parts[-1])
                     else:
-                        await tg_edit_message(chat_id, message_id, body)
-                    last_edit = tnow
+                        await tg_edit_message(chat_id, message_id, parts[0])
 
-            # 结束后补尾注
-            final_body = make_safe_html(acc) + make_footnotes_html(footnotes)
+                    last_edit = now_mono
+                    buf = ""
+
+            # 收尾（加脚注）
+            final_out = _sanitize_plain_text(acc) if SANITIZE_OUTPUT else acc
+            final_body = make_safe_html(final_out) + make_footnotes_html(footnotes)
             final_parts = telegram_split(final_body)
-            # 把第一段编辑到当前消息
+
             await tg_edit_message(chat_id, message_id, final_parts[0])
-            # 其余段落追加发送
             for extra in final_parts[1:]:
                 await tg_send_message(chat_id, extra)
 
@@ -348,10 +363,11 @@ async def answer_and_stream(chat_id: int, user_id: int, text: str, reply_to: Opt
             _append_history(chat_id, user_id, "assistant", acc)
 
         except Exception as e:
-            # 出错降级成普通完整回复
+            # 降级为一次性完整回复
             try:
                 reply_text = await openai_chat(messages, use_stream=False)
-                body = make_safe_html(reply_text) + make_footnotes_html(footnotes)
+                final_out = _sanitize_plain_text(reply_text) if SANITIZE_OUTPUT else reply_text
+                body = make_safe_html(final_out) + make_footnotes_html(footnotes)
                 parts = telegram_split(body)
                 await tg_edit_message(chat_id, message_id, parts[0])
                 for extra in parts[1:]:
@@ -364,9 +380,10 @@ async def answer_and_stream(chat_id: int, user_id: int, text: str, reply_to: Opt
         # 非流式：一次性发送
         try:
             reply_text = await openai_chat(messages, use_stream=False)
-            body = make_safe_html(reply_text) + make_footnotes_html(footnotes)
+            final_out = _sanitize_plain_text(reply_text) if SANITIZE_OUTPUT else reply_text
+            body = make_safe_html(final_out) + make_footnotes_html(footnotes)
             parts = telegram_split(body)
-            first = await tg_send_message(chat_id, parts[0], reply_to=reply_to)
+            await tg_send_message(chat_id, parts[0], reply_to=reply_to)
             for extra in parts[1:]:
                 await tg_send_message(chat_id, extra)
             _append_history(chat_id, user_id, "user", text)
@@ -379,7 +396,6 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup_event():
-    # 24h 清理 → 提升为 12h
     async def background_tasks():
         while True:
             await asyncio.sleep(43200)
@@ -413,19 +429,19 @@ async def telegram_webhook(request: Request):
     cmd = text.strip().lower()
     if cmd == "/start":
         tips = (
-            "<b>✅ 已开启 ChatGPT 风格体验</b>\n"
-            "• 实时联网搜索（自动判断是否需要）\n"
-            "• 流式输出（边生成边刷新）\n"
-            "• 48 小时上下文记忆，/clear 可清空\n"
-            "• HTML 渲染更清晰，自动分片避免 4096 限制\n"
-            "• 环境变量 STREAM_REPLY=1 可开关流式\n"
+            "已开启 ChatGPT 风格体验\n"
+            "实时联网搜索（自动判断是否需要）\n"
+            "流式输出（边生成边刷新）\n"
+            "48 小时上下文记忆，输入 /clear 可清空\n"
+            "HTML 渲染更清晰，自动分片避免 4096 限制\n"
+            "使用环境变量 STREAM_REPLY 控制是否开启流式"
         )
         await tg_send_message(chat_id, tips)
         return PlainTextResponse("ok")
 
     if cmd == "/clear":
         _conversations.pop(_conv_key(chat_id, user_id), None)
-        await tg_send_message(chat_id, "✅ 已清空你的上下文。")
+        await tg_send_message(chat_id, "已清空你的上下文")
         return PlainTextResponse("ok")
 
     # 主逻辑：回答并流式输出
