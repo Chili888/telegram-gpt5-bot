@@ -1,9 +1,21 @@
-python-telegram-bot[job-queue,rate-limiter]==21.4
+# Web framework
 fastapi==0.112.2
 uvicorn==0.30.6
-aiosqlite==0.20.0
-pytz==2024.2
-python-dotenv==1.0.1
+
+# HTTP requests
 httpx==0.27.0
-google-search-results==2.4.2   # SerpAPI 官方库
-serpapi==0.1.5
+
+# Async SQLite (如需持久化)
+aiosqlite==0.20.0
+
+# 时区处理
+pytz==2024.2
+
+# 环境变量
+python-dotenv==1.0.1
+
+# 日期解析（用于搜索结果新鲜度识别）
+dateparser==1.2.0
+
+# Telegram Bot API
+python-telegram-bot[job-queue,rate-limiter]==21.4
