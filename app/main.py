@@ -13,7 +13,7 @@ from fastapi.responses import PlainTextResponse
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")   # 默认 GPT-4o（GPT-5 内核）
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")   # 默认 GPT-4o
 WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "dev-secret")
 SERPAPI_KEY     = os.getenv("SERPAPI_KEY", "")
 TIMEOUT_SEC     = int(os.getenv("TIMEOUT_SEC", "60"))
@@ -148,20 +148,14 @@ async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = Non
 
 # ================== 自动清理过期上下文 ==================
 async def cleanup_history():
-    """清理超过24小时的上下文"""
     now = time.time()
-    expired = 0
     for key, dq in list(_conversations.items()):
         new_dq = deque([m for m in dq if now - m.get("ts", 0) < 86400], maxlen=dq.maxlen)
-        if len(new_dq) < len(dq):
-            expired += len(dq) - len(new_dq)
         _conversations[key] = new_dq
-    if expired:
-        print(f"[CLEANUP] 清理了 {expired} 条过期上下文")
 
 async def background_tasks():
     while True:
-        await asyncio.sleep(86400)  # 每24小时执行一次
+        await asyncio.sleep(86400)
         await cleanup_history()
 
 # ================== FastAPI 路由 ==================
@@ -211,8 +205,16 @@ async def telegram_webhook(request: Request):
         return PlainTextResponse("ok")
     _last_call_ts[key] = now
 
-    # 🔍 先搜索
-    search_results = await search_web(text)
+    # 🔍 智能构造搜索 query（结合上下文）
+    search_query = text
+    if len(text) < 6:  # 短语，比如 "最新动态"
+        hist = list(_get_history(chat_id, user_id))
+        if hist:
+            last_user = [m["content"] for m in reversed(hist) if m["role"] == "user"]
+            if last_user:
+                search_query = last_user[0] + " " + text
+
+    search_results = await search_web(search_query)
 
     # 构造上下文
     messages = _build_messages(chat_id, user_id, text, search_results)
