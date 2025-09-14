@@ -28,8 +28,9 @@ HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS", "16000"))
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SYSTEM_PROMPT = (
     "You are ChatGPT with real-time browsing ability. "
-    "You MUST always base your answers ONLY on the search results provided. "
-    "If no search results are available, reply '未找到最新相关信息'. "
+    "Always answer based ONLY on the latest search results provided, "
+    "and integrate them into a natural, conversational reply. "
+    "Do not list raw links unless explicitly asked by the user. "
     "Respond in the same language as the user."
 )
 
@@ -125,10 +126,9 @@ async def search_web(query: str) -> str:
         results = []
         for item in data.get("organic_results", [])[:5]:
             title = item.get("title", "")
-            link = item.get("link", "")
             snippet = item.get("snippet", "")
-            results.append(f"▪️ {title}\n{snippet}\n{link}")
-        return "\n\n".join(results) if results else "未找到相关搜索结果"
+            results.append(f"{title}: {snippet}")
+        return "\n".join(results) if results else "未找到相关搜索结果"
     except Exception as e:
         return f"❌ 搜索失败: {e}"
 
@@ -206,18 +206,17 @@ async def telegram_webhook(request: Request):
 
     # 🔍 智能构造搜索 query（结合上下文）
     search_query = text
-    if len(text) < 6:  # 短语，比如 "最新动态"
+    if len(text) < 6:
         hist = list(_get_history(chat_id, user_id))
         if hist:
             last_user = [m["content"] for m in reversed(hist) if m["role"] == "user"]
             if last_user:
                 search_query = last_user[0] + " " + text
 
-    # 先搜索 → 直接返回原始结果给用户
+    # 联网搜索
     search_results = await search_web(search_query)
-    await tg_send_message(chat_id, f"🔎 最新搜索结果:\n\n{search_results}", reply_to=message_id)
 
-    # 构造上下文（带搜索结果 → GPT 总结）
+    # 构造上下文
     messages = _build_messages(chat_id, user_id, text, search_results)
 
     try:
