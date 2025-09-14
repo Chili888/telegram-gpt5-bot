@@ -1,43 +1,48 @@
 # app/main.py
-import os, asyncio, time
-from typing import Any, Dict, List, Deque, Optional, Tuple
+import os
+import asyncio
+import time
+import re
+from typing import Any, Dict, List, Deque, Optional
 from collections import deque
-import httpx
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 
-# ========= 环境变量 =========
+# ================== 环境变量 ==================
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")  # 默认用 gpt-4o
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")   # 默认 GPT-4o
 WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "dev-secret")
-SERPAPI_KEY     = os.getenv("SERPAPI_KEY", "")  # 联网搜索用
-
+SERPAPI_KEY     = os.getenv("SERPAPI_KEY", "")          # ✅ 必须配置 SerpAPI key
 TIMEOUT_SEC     = int(os.getenv("TIMEOUT_SEC", "60"))
+
 OPENAI_MAX_CONCURRENCY = int(os.getenv("OPENAI_MAX_CONCURRENCY", "2"))
-CHAT_COOLDOWN_SEC = float(os.getenv("CHAT_COOLDOWN_SEC", "1.2"))
+CHAT_COOLDOWN_SEC      = float(os.getenv("CHAT_COOLDOWN_SEC", "1.2"))
 
 HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "8"))
 HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS", "16000"))
 
-SESSION_SCOPE = os.getenv("SESSION_SCOPE", "per_user").lower().strip()  # per_user | per_chat
-
-# ========= 客户端 =========
+# ================== 常量与客户端 ==================
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-SYSTEM_PROMPT = "你是 ChatGPT，始终结合联网搜索结果回答用户，确保回答最新、真实、有帮助。"
+SYSTEM_PROMPT = (
+    "You are ChatGPT with real-time browsing ability. "
+    "Always use the latest search results provided to you. "
+    "Respond in the same language as the user."
+)
 
 client = httpx.AsyncClient(timeout=TIMEOUT_SEC)
 _openai_sema = asyncio.Semaphore(OPENAI_MAX_CONCURRENCY)
+_last_call_ts: Dict[int, float] = {}
 
-# ========= 会话存储 =========
-_conversations: Dict[Tuple[int, Optional[int]], Deque[Dict[str, str]]] = {}
-_last_call_ts: Dict[Tuple[int, Optional[int]], float] = {}
+# 会话存储
+_conversations: Dict[int, Deque[Dict[str, str]]] = {}
 
 app = FastAPI()
 
-# ========= Telegram =========
+# ================== Telegram 工具 ==================
 async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_to:
@@ -46,119 +51,147 @@ async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = Non
     r.raise_for_status()
     return r.json()
 
-# ========= 上下文工具 =========
-def _session_key(chat_id: int, user_id: Optional[int]) -> Tuple[int, Optional[int]]:
-    return (chat_id, None) if SESSION_SCOPE == "per_chat" else (chat_id, user_id)
+# ================== 会话记忆 ==================
+def _get_history(chat_id: int) -> Deque[Dict[str, str]]:
+    if chat_id not in _conversations:
+        _conversations[chat_id] = deque(maxlen=HISTORY_MAX_TURNS * 2)
+    return _conversations[chat_id]
 
-def _get_history(session_key: Tuple[int, Optional[int]]) -> Deque[Dict[str, str]]:
-    if session_key not in _conversations:
-        _conversations[session_key] = deque(maxlen=HISTORY_MAX_TURNS * 2)
-    return _conversations[session_key]
+def _append_history(chat_id: int, role: str, content: str):
+    _get_history(chat_id).append({"role": role, "content": content})
 
-def _append_history(session_key: Tuple[int, Optional[int]], role: str, content: str):
-    _get_history(session_key).append({"role": role, "content": content})
-
-def _build_messages(session_key: Tuple[int, Optional[int]], user_text: str, web_snippets: str) -> List[Dict[str, str]]:
-    hist = list(_get_history(session_key))
-    messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if web_snippets:
-        messages.append({"role": "system", "content": "以下是最新的网络搜索结果:\n" + web_snippets})
-
+def _build_messages(chat_id: int, user_text: str, search_results: str) -> List[Dict[str, str]]:
+    hist = list(_get_history(chat_id))
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": f"Here are the latest search results:\n{search_results}"}
+    ]
     acc: List[Dict[str, str]] = []
     total = 0
     for m in reversed(hist):
         c = m.get("content") or ""
         if total + len(c) > HISTORY_MAX_CHARS:
             break
-        acc.append(m); total += len(c)
+        acc.append(m)
+        total += len(c)
     messages.extend(reversed(acc))
     messages.append({"role": "user", "content": user_text})
     return messages
 
-# ========= 搜索（SerpAPI） =========
-async def web_search(query: str, num: int = 5) -> str:
-    if not SERPAPI_KEY:
-        return ""
-    url = "https://serpapi.com/search"
-    params = {"q": query, "hl": "zh-cn", "gl": "us", "num": num, "api_key": SERPAPI_KEY}
-    try:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-        snippets = []
-        for item in data.get("organic_results", [])[:num]:
-            title = item.get("title"); link = item.get("link"); snip = item.get("snippet")
-            if title and snip:
-                snippets.append(f"{title}: {snip} ({link})")
-        return "\n".join(snippets)
-    except Exception as e:
-        return f"(⚠️ 搜索失败: {e})"
-
-# ========= OpenAI =========
+# ================== OpenAI 调用 ==================
 async def _chat_once(model: str, messages: List[Dict[str, str]]) -> str:
     url = f"{OPENAI_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     body = {"model": model, "messages": messages, "temperature": 0.7}
+
     async with _openai_sema:
-        resp = await client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        delay = 1.0
+        for _ in range(5):
+            try:
+                resp = await client.post(url, headers=headers, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status in (429, 503):
+                    ra = e.response.headers.get("retry-after")
+                    wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else delay
+                    await asyncio.sleep(wait)
+                    delay = min(delay * 2, 20.0)
+                    continue
+                raise
+            except httpx.HTTPError:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 20.0)
+                continue
+        raise httpx.HTTPError("OpenAI服务繁忙，请稍后再试")
 
 async def openai_chat(messages: List[Dict[str, str]]) -> str:
-    for model in [OPENAI_MODEL, "gpt-4o", "gpt-4o-mini"]:
+    preferred = [OPENAI_MODEL, "gpt-4o", "gpt-4o-mini"]
+    for model in preferred:
         try:
             return await _chat_once(model, messages)
         except Exception:
             continue
     raise RuntimeError("OpenAI 调用失败")
 
-# ========= 健康检查 =========
+# ================== 搜索功能 (SerpAPI) ==================
+async def search_web(query: str) -> str:
+    if not SERPAPI_KEY:
+        return "⚠️ 未配置 SerpAPI_KEY，无法联网搜索。"
+    url = "https://serpapi.com/search"
+    params = {"q": query, "hl": "zh-cn", "gl": "cn", "api_key": SERPAPI_KEY}
+    try:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for item in data.get("organic_results", [])[:5]:
+            title = item.get("title", "")
+            link = item.get("link", "")
+            snippet = item.get("snippet", "")
+            results.append(f"- {title}\n{snippet}\n{link}")
+        return "\n\n".join(results) if results else "未找到相关搜索结果"
+    except Exception as e:
+        return f"❌ 搜索失败: {e}"
+
+# ================== 文本清理 ==================
+def clean_text(text: str) -> str:
+    return re.sub(r"[#*`>]", "", text)
+
+# ================== FastAPI 路由 ==================
 @app.get("/healthz")
-async def healthz(): return PlainTextResponse("ok")
+async def healthz():
+    return PlainTextResponse("ok")
 
 @app.get("/")
-async def root(): return PlainTextResponse("ok")
+async def root():
+    return PlainTextResponse("ok")
 
-# ========= Telegram Webhook =========
 @app.post(f"/webhook/{WEBHOOK_SECRET}")
 async def telegram_webhook(request: Request):
     update: Dict[str, Any] = await request.json()
-    msg = update.get("message") or update.get("edited_message")
-    if not msg: return PlainTextResponse("ok")
+    msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
+    if not msg:
+        return PlainTextResponse("ok")
 
-    chat = msg.get("chat", {}); user = msg.get("from", {}) or {}
-    chat_id, user_id = chat.get("id"), user.get("id")
-    session_key = _session_key(chat_id, user_id)
+    chat_id = msg.get("chat", {}).get("id")
+    text = msg.get("text")
+    message_id = msg.get("message_id")
 
-    text = msg.get("text"); message_id = msg.get("message_id")
-    if not text: return PlainTextResponse("ok")
+    if not text:
+        await tg_send_message(chat_id, "我目前只支持文字消息～", reply_to=message_id)
+        return PlainTextResponse("ok")
 
     cmd = text.strip().lower()
     if cmd == "/start":
-        await tg_send_message(chat_id, "✅ 我已开启联网 + 上下文记忆，直接聊天吧！")
+        await tg_send_message(chat_id, "✅ 你好！我已开启上下文记忆 + 实时联网搜索，直接发消息继续对话吧～")
         return PlainTextResponse("ok")
     if cmd == "/clear":
-        _conversations.pop(session_key, None)
-        await tg_send_message(chat_id, "✅ 已清空你在此群的个人上下文。")
+        _conversations.pop(chat_id, None)
+        await tg_send_message(chat_id, "✅ 已清空本会话上下文。")
         return PlainTextResponse("ok")
 
     now = time.time()
-    if now - _last_call_ts.get(session_key, 0.0) < CHAT_COOLDOWN_SEC:
-        await tg_send_message(chat_id, "⏳ 正在处理上一条，请稍等…", reply_to=message_id)
+    if now - _last_call_ts.get(chat_id, 0.0) < CHAT_COOLDOWN_SEC:
+        await tg_send_message(chat_id, "我正在处理上一条消息，请稍等片刻～", reply_to=message_id)
         return PlainTextResponse("ok")
-    _last_call_ts[session_key] = now
+    _last_call_ts[chat_id] = now
 
-    # 🔎 每次先联网搜索
-    web_snippets = await web_search(text)
+    # 🔍 先搜索
+    search_results = await search_web(text)
 
-    messages = _build_messages(session_key, text, web_snippets)
+    # 构造上下文
+    messages = _build_messages(chat_id, text, search_results)
+
     try:
         reply = await openai_chat(messages)
+        reply = clean_text(reply)
         await tg_send_message(chat_id, reply, reply_to=message_id)
-        _append_history(session_key, "user", text)
-        _append_history(session_key, "assistant", reply)
+        _append_history(chat_id, "user", text)
+        _append_history(chat_id, "assistant", reply)
     except Exception as e:
-        await tg_send_message(chat_id, f"❌ 出错: {e}", reply_to=message_id)
+        await tg_send_message(chat_id, f"❌ 错误: {e}", reply_to=message_id)
 
     return PlainTextResponse("ok")
