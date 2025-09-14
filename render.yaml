@@ -1,36 +1,16 @@
 services:
   - type: web
-    name: telegram-gpt-bot
+    name: telegram-gpt5-bot
     env: python
-    region: oregon   # 可改成 frankfurt / singapore / ohio 等
-    plan: free       # 免费套餐，内存 512MB
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000
     envVars:
       - key: BOT_TOKEN
-        sync: false   # 在 Render 控制台 → Environment 添加
+        sync: false
       - key: OPENAI_API_KEY
         sync: false
       - key: SERPAPI_KEY
-        sync: false   # 如果只用 Bing，可删除
-      - key: BING_KEY
-        sync: false   # 如果不用 Bing，可删除
+        sync: false
       - key: WEBHOOK_SECRET
-        sync: false   # 随机字符串，例如 supersecret123
-      - key: OPENAI_MODEL
-        value: gpt-4.1
-      - key: OPENAI_BASE_URL
-        value: https://api.openai.com/v1
-      - key: TIMEOUT_SEC
-        value: "60"
-      - key: OPENAI_MAX_CONCURRENCY
-        value: "2"
-      - key: CHAT_COOLDOWN_SEC
-        value: "1.2"
-      - key: HISTORY_MAX_TURNS
-        value: "8"
-      - key: HISTORY_MAX_CHARS
-        value: "16000"
+        sync: false
+        
