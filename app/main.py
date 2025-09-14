@@ -14,7 +14,7 @@ from fastapi.responses import PlainTextResponse
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")   # 默认 GPT-4o
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o")
 WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "mysecret123")
 SERPAPI_KEY     = os.getenv("SERPAPI_KEY", "")
 TIMEOUT_SEC     = int(os.getenv("TIMEOUT_SEC", "60"))
@@ -23,35 +23,56 @@ OPENAI_MAX_CONCURRENCY = int(os.getenv("OPENAI_MAX_CONCURRENCY", "2"))
 CHAT_COOLDOWN_SEC      = float(os.getenv("CHAT_COOLDOWN_SEC", "1.2"))
 
 HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "12"))
-# 改为 24 小时记忆
-HISTORY_LIFESPAN  = float(os.getenv("HISTORY_LIFESPAN_SEC", "86400"))
+HISTORY_LIFESPAN  = float(os.getenv("HISTORY_LIFESPAN_SEC", "86400"))   # 24 小时
 
-# 统一取消流式输出（固定为 False）
-STREAM_REPLY      = False
-TELEGRAM_PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE", "HTML")
-DISABLE_LINK_PREVIEW = os.getenv("DISABLE_LINK_PREVIEW", "1") == "1"
+# 输出风格与长度控制
+DETAIL_LEVEL   = os.getenv("DETAIL_LEVEL", "deep")        # brief / standard / deep
+MAX_TOKENS     = int(os.getenv("MAX_TOKENS", "1400"))     # 回答最大 token
+STRICT_MODEL   = os.getenv("STRICT_MODEL", "0") == "1"    # 为 1 时禁止降级
 
-# 输出净化（去星号/项目符号/重复标点，代码块除外）
-SANITIZE_OUTPUT   = os.getenv("SANITIZE_OUTPUT", "1") == "1"
+# 搜索厚度与时效
+SEARCH_MAX_ORGANIC = int(os.getenv("SEARCH_MAX_ORGANIC", "8"))
+SEARCH_MAX_NEWS    = int(os.getenv("SEARCH_MAX_NEWS", "5"))
+SEARCH_RECENCY     = os.getenv("SEARCH_RECENCY", "")      # "", "h" 小时, "d" 日, "w" 周, "m" 月
+SEARCH_HL          = os.getenv("SEARCH_HL", "zh-cn")      # 搜索语言
+SEARCH_GL          = os.getenv("SEARCH_GL", "us")         # 搜索地域
+
+# 文本渲染与净化
+TELEGRAM_PARSE_MODE   = os.getenv("TELEGRAM_PARSE_MODE", "HTML")
+DISABLE_LINK_PREVIEW  = os.getenv("DISABLE_LINK_PREVIEW", "1") == "1"
+SANITIZE_OUTPUT       = os.getenv("SANITIZE_OUTPUT", "1") == "1"
 
 # ================== 常量与客户端 ==================
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# 强化：始终基于搜索结果回答
+def _style_instruction() -> str:
+    if DETAIL_LEVEL == "brief":
+        return "Write 4-6 full sentences in 1-2 short paragraphs."
+    if DETAIL_LEVEL == "standard":
+        return "Write 8-12 sentences across 2-4 paragraphs with clear structure."
+    return ("Write 12-20 sentences across 3-5 short paragraphs. "
+            "Start with quick context, then the latest updates from sources, include nuance and uncertainties, "
+            "end with what to watch next. Plain text paragraphs only.")
+
 SYSTEM_PROMPT = (
     "You are ChatGPT with real-time browsing ability.\n"
-    "Always answer based ONLY on the latest search notes provided below.\n"
-    "Use plain sentences with simple punctuation. Do not use bullets, asterisks, Markdown, or emojis unless the user asks.\n"
-    "If the search notes are insufficient, say so briefly and keep the answer concise.\n"
-    "Respond in the user's language."
+    "Primarily rely on the fresh search notes below, but you may add stable background facts for context. "
+    "Clearly separate background vs new updates when useful.\n"
+    f"{_style_instruction()}\n"
+    "Use clean plain sentences. Do not use bullets, asterisks, Markdown decorations, or emojis."
 )
 
 client = httpx.AsyncClient(timeout=TIMEOUT_SEC)
 _openai_sema = asyncio.Semaphore(OPENAI_MAX_CONCURRENCY)
 _last_call_ts: Dict[str, float] = {}
 
+# 跟踪信息（调试/状态）
+_last_model_used: Dict[str, str] = {}
+_last_search_query: Dict[str, str] = {}
+
 # ================== 会话存储（内存：chat_id:user_id 维度） ==================
 _conversations: Dict[str, Deque[Dict[str, Any]]] = {}
+_session_topic: Dict[str, str] = {}  # 当前会话主体（如“黄仁勋”）
 
 def _conv_key(chat_id: int | str, user_id: int | str) -> str:
     return f"{chat_id}:{user_id}"
@@ -63,9 +84,7 @@ def _get_history(chat_id: int, user_id: int) -> Deque[Dict[str, Any]]:
     return _conversations[key]
 
 def _append_history(chat_id: int, user_id: int, role: str, content: str):
-    _get_history(chat_id, user_id).append({
-        "role": role, "content": content, "ts": time.time()
-    })
+    _get_history(chat_id, user_id).append({"role": role, "content": content, "ts": time.time()})
 
 def _prune_old():
     now = time.time()
@@ -75,12 +94,11 @@ def _prune_old():
             maxlen=dq.maxlen
         )
 
-def _build_messages(chat_id: int, user_id: int, user_text: str, search_block: Optional[str]) -> List[Dict[str, str]]:
+def _build_messages(chat_id: int, user_id: int, user_text: str, search_block: str) -> List[Dict[str, str]]:
     hist = [m for m in _get_history(chat_id, user_id) if time.time() - m.get("ts", 0) < HISTORY_LIFESPAN]
     messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    # 总是把搜索结果作为系统补充（每次自动联网）
     messages.append({"role": "system", "content": f"Here are the latest search notes:\n{search_block or 'No search results.'}"})
-    # 组装最近对话历史（控制字符数）
+    # 控制历史拼接长度
     total_chars = 0
     acc: List[Dict[str, str]] = []
     for m in reversed(hist):
@@ -93,13 +111,9 @@ def _build_messages(chat_id: int, user_id: int, user_text: str, search_block: Op
     messages.append({"role": "user", "content": user_text})
     return messages
 
-# ================== 工具：HTML 安全处理 & 拼接 ==================
+# ================== HTML 与文本净化 ==================
 def escape_html(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-    )
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def make_safe_html(text: str) -> str:
     return escape_html(text)
@@ -116,34 +130,23 @@ def telegram_split(text: str, limit: int = 4096) -> List[str]:
         chunks.append(text)
     return chunks
 
-# ================== 输出清理（去星号/项目符号/Markdown符号/重复标点） ==================
 _PUNCT_BULLETS = r"[*•·▪◦◆◇★☆✦✧❖▶►▷◁▸▹◀◁➤➔→⇒➜➤]"
 _MD_MARKS      = r"[`_#>]"
 
 def _sanitize_plain_text(text: str) -> str:
-    # 避免破坏代码块
+    # 不破坏代码块
     if "```" in text:
         return text
-    # 行首项目符号
-    text = re.sub(r"(?m)^\s*[-–—"+_PUNCT_BULLETS+r"]\s+", "", text)
-    # 移除 Markdown 符号与项目符号字符
-    text = re.sub(_MD_MARKS, "", text)
-    text = re.sub(_PUNCT_BULLETS, "", text)
-    # 统一引号
-    text = text.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-    # 合并重复标点
-    text = re.sub(r"([!！?？.,，。;；:：\-—])\1{1,}", r"\1", text)
-    # 去掉行首多余符号
-    text = re.sub(r"(?m)^[\-\—\·\•\*]+\s*", "", text)
-    return text.strip()
+    t = text
+    t = re.sub(r"(?m)^\s*[-–—"+_PUNCT_BULLETS+r"]\s+", "", t)  # 行首项目符号
+    t = re.sub(_MD_MARKS, "", t)                              # Markdown 装饰
+    t = re.sub(_PUNCT_BULLETS, "", t)                         # 其他符号
+    t = t.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    t = re.sub(r"([!！?？.,，。;；:：\-—])\1{1,}", r"\1", t)    # 合并重复标点
+    t = re.sub(r"(?m)^[\-\—\·\•\*]+\s*", "", t)               # 去行首多余符号
+    return t.strip()
 
 # ================== Telegram 工具 ==================
-async def tg_send_chat_action(chat_id: int, action: str = "typing"):
-    try:
-        await client.post(f"{TELEGRAM_API}/sendChatAction", json={"chat_id": chat_id, "action": action})
-    except Exception:
-        pass
-
 async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = None) -> Dict[str, Any]:
     payload = {
         "chat_id": chat_id,
@@ -158,31 +161,61 @@ async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = Non
     return r.json()
 
 # ================== 搜索功能（SerpAPI） ==================
+# 规范化查询 + 主体提取
+_CANON = [
+    (re.compile(r"(黄仁勋|黄仁勛|詹森.?黄|Jensen\s*Huang)", re.I), "黄仁勋"),
+    (re.compile(r"(特朗普|川普|Donald\s*Trump|唐纳德.?特朗普)", re.I), "特朗普"),
+    (re.compile(r"(英伟达|NVIDIA)", re.I), "英伟达"),
+    (re.compile(r"(英国|Britain|United\s*Kingdom|U\.?K\.?)", re.I), "英国"),
+]
+
+def _normalize_query(text: str) -> str:
+    q = text.strip()
+    q = re.sub(r"[摇瑶咬](?=拜访)", "将", q)   # “摇/瑶/咬拜访” -> “将拜访”
+    for pat, canon in _CANON:
+        q = pat.sub(canon, q)
+    q = re.sub(r"\s+", " ", q)
+    return q
+
+def _extract_canonical_entity(text: str) -> Optional[str]:
+    for pat, canon in _CANON:
+        if canon in ("黄仁勋", "特朗普") and pat.search(text or ""):
+            return canon
+    for pat, canon in _CANON:
+        if pat.search(text or ""):
+            return canon
+    return None
+
+def build_smart_query(text: str, hist: Deque[Dict[str, Any]], key: str) -> str:
+    raw = text.strip()
+    q = _normalize_query(raw)
+    need_expand = (len(q) <= 8) or re.search(r"\b(他|她|它)\b", q)
+    topic = _session_topic.get(key, "")
+    if need_expand and topic:
+        q = q.replace("他", topic).replace("她", topic).replace("它", topic)
+        if not q.startswith(topic):
+            q = f"{topic} {q}"
+    if re.fullmatch(r"(和|与)?特朗普", q) and topic:
+        q = f"{topic} 特朗普 互动 动态 英国 将拜访"
+    return q
+
 def _format_search_results(data: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]]]:
-    """
-    返回 (用于塞给模型的纯文本 block, [(title, url)] 供可选脚注)
-    """
     results_txt_lines: List[str] = []
     footnotes: List[Tuple[str, str]] = []
 
     def add_item(title: str, snippet: str, link: str):
         if not title and not snippet:
             return
-        # 用简单行文，不加花哨符号
         line = f"{title or '(no title)'}: {snippet or ''} [{link}]".strip()
         results_txt_lines.append(line)
         if title and link:
             footnotes.append((title, link))
 
-    # Organic
-    for item in data.get("organic_results", [])[:5]:
+    for item in data.get("organic_results", [])[:SEARCH_MAX_ORGANIC]:
+        add_item(item.get("title", ""), item.get("snippet", ""), item.get("link", ""))
+    for item in data.get("news_results", [])[:SEARCH_MAX_NEWS]:
         add_item(item.get("title", ""), item.get("snippet", ""), item.get("link", ""))
 
-    # News
-    for item in data.get("news_results", [])[:3]:
-        add_item(item.get("title", ""), item.get("snippet", ""), item.get("link", ""))
-
-    # Answer box
     abox = data.get("answer_box") or {}
     if abox:
         add_item(abox.get("title", "Answer"), abox.get("snippet", "") or abox.get("answer", ""), abox.get("link", ""))
@@ -191,10 +224,11 @@ def _format_search_results(data: Dict[str, Any]) -> Tuple[str, List[Tuple[str, s
 
 async def search_web(query: str) -> Tuple[str, List[Tuple[str, str]]]:
     if not SERPAPI_KEY:
-        # 强制联网搜索：未配置时给出明确提示
         return "Search disabled (SERPAPI_KEY not set). Please set SERPAPI_KEY to enable live browsing.", []
     url = "https://serpapi.com/search"
-    params = {"q": query, "hl": "zh-cn", "gl": "cn", "api_key": SERPAPI_KEY}
+    params = {"q": query, "hl": SEARCH_HL, "gl": SEARCH_GL, "api_key": SERPAPI_KEY}
+    if SEARCH_RECENCY:
+        params["tbs"] = f"qdr:{SEARCH_RECENCY}"   # 例：qdr:w（最近一周）
     try:
         r = await client.get(url, params=params)
         r.raise_for_status()
@@ -203,11 +237,11 @@ async def search_web(query: str) -> Tuple[str, List[Tuple[str, str]]]:
     except Exception as e:
         return f"Search error: {e}", []
 
-# ================== OpenAI 调用（非流式） ==================
+# ================== OpenAI 调用（一次性非流式） ==================
 async def _chat_once(model: str, messages: List[Dict[str, str]]):
     url = f"{OPENAI_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    body = {"model": model, "messages": messages, "temperature": 0.7}
+    body = {"model": model, "messages": messages, "temperature": 0.5, "max_tokens": MAX_TOKENS}
 
     async with _openai_sema:
         delay = 1.0
@@ -232,24 +266,18 @@ async def _chat_once(model: str, messages: List[Dict[str, str]]):
                 continue
         raise httpx.HTTPError("OpenAI 服务繁忙，请稍后再试")
 
-async def openai_chat(messages: List[Dict[str, str]]):
-    preferred = [OPENAI_MODEL, "gpt-4o", "gpt-4o-mini"]
-    for model in preferred:
+async def openai_chat(messages: List[Dict[str, str]], key: str = "global"):
+    models = [OPENAI_MODEL] if STRICT_MODEL else [OPENAI_MODEL, "gpt-4o", "gpt-4o-mini"]
+    for m in models:
         try:
-            return await _chat_once(model, messages)
+            out = await _chat_once(m, messages)
+            _last_model_used[key] = m
+            return out
         except Exception:
             continue
     raise RuntimeError("OpenAI 调用失败")
 
 # ================== 业务逻辑 ==================
-def build_smart_query(text: str, hist: Deque[Dict[str, Any]]) -> str:
-    text_strip = text.strip()
-    if len(text_strip) >= 6:
-        return text_strip
-    # 短语时结合上文
-    last_user = next((m["content"] for m in reversed(hist) if m["role"] == "user"), "")
-    return (last_user + " " + text_strip).strip() if last_user else text_strip
-
 def make_footnotes_html(footnotes: List[Tuple[str, str]]) -> str:
     if not footnotes:
         return ""
@@ -268,6 +296,13 @@ def make_footnotes_html(footnotes: List[Tuple[str, str]]) -> str:
             break
     return "\n" + "\n".join(lines)
 
+def _maybe_update_topic(key: str, user_text: str, search_notes: str, reply_text: str):
+    for s in (user_text, search_notes, reply_text):
+        ent = _extract_canonical_entity(s or "")
+        if ent:
+            _session_topic[key] = ent
+            return
+
 async def answer_once(chat_id: int, user_id: int, text: str, reply_to: Optional[int]):
     # 限流（每个用户）
     now = time.time()
@@ -279,13 +314,14 @@ async def answer_once(chat_id: int, user_id: int, text: str, reply_to: Optional[
 
     # 每次都联网搜索
     hist = _get_history(chat_id, user_id)
-    search_query = build_smart_query(text, hist)
+    search_query = build_smart_query(text, hist, key)
+    _last_search_query[key] = search_query
     search_block, footnotes = await search_web(search_query)
 
-    # 构造上下文并一次性生成
+    # 组装消息并一次性生成
     messages = _build_messages(chat_id, user_id, text, search_block)
     try:
-        reply_text = await openai_chat(messages)
+        reply_text = await openai_chat(messages, key=key)
         final_out = _sanitize_plain_text(reply_text) if SANITIZE_OUTPUT else reply_text
         body = make_safe_html(final_out) + make_footnotes_html(footnotes)
         parts = telegram_split(body)
@@ -294,6 +330,7 @@ async def answer_once(chat_id: int, user_id: int, text: str, reply_to: Optional[
             await tg_send_message(chat_id, extra)
         _append_history(chat_id, user_id, "user", text)
         _append_history(chat_id, user_id, "assistant", reply_text)
+        _maybe_update_topic(key, text, search_block, reply_text)
     except Exception as e:
         await tg_send_message(chat_id, f"错误: {escape_html(str(e))}", reply_to=reply_to)
 
@@ -336,14 +373,29 @@ async def telegram_webhook(request: Request):
     if cmd == "/start":
         tips = (
             "已开启：自动联网搜索 + 一次性完整回复 + 24小时上下文记忆\n"
-            "输入 /clear 可清空上下文"
+            "输入 /clear 可清空上下文，输入 /status 可查看运行状态"
         )
         await tg_send_message(chat_id, tips)
         return PlainTextResponse("ok")
 
     if cmd == "/clear":
         _conversations.pop(_conv_key(chat_id, user_id), None)
+        _session_topic.pop(_conv_key(chat_id, user_id), None)
         await tg_send_message(chat_id, "已清空你的上下文")
+        return PlainTextResponse("ok")
+
+    if cmd == "/status":
+        key = _conv_key(chat_id, user_id)
+        topic = _session_topic.get(key, "(未记住主体)")
+        serp = "已配置" if SERPAPI_KEY else "未配置"
+        model_used = _last_model_used.get(key, "(尚未调用)")
+        last_q = _last_search_query.get(key, "(无)")
+        await tg_send_message(
+            chat_id,
+            f"当前主体：{topic}\nSerpAPI：{serp}\n最近使用模型：{model_used}\n最近搜索词：{last_q}\n"
+            f"记忆窗口：24小时；历史上限：{HISTORY_MAX_TURNS} 轮\n细节级别：{DETAIL_LEVEL}；max_tokens：{MAX_TOKENS}\n"
+            f"搜索厚度：organic={SEARCH_MAX_ORGANIC}, news={SEARCH_MAX_NEWS}, recency={SEARCH_RECENCY or '不限'}"
+        )
         return PlainTextResponse("ok")
 
     # 主逻辑：每次联网 + 非流式一次性回复
