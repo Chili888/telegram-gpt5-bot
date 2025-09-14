@@ -23,25 +23,26 @@ OPENAI_MAX_CONCURRENCY = int(os.getenv("OPENAI_MAX_CONCURRENCY", "2"))
 CHAT_COOLDOWN_SEC      = float(os.getenv("CHAT_COOLDOWN_SEC", "1.2"))
 
 HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "12"))
-HISTORY_LIFESPAN  = float(os.getenv("HISTORY_LIFESPAN_SEC", "172800"))
+# 改为 24 小时记忆
+HISTORY_LIFESPAN  = float(os.getenv("HISTORY_LIFESPAN_SEC", "86400"))
 
-STREAM_REPLY      = os.getenv("STREAM_REPLY", "1") == "1"
+# 统一取消流式输出（固定为 False）
+STREAM_REPLY      = False
 TELEGRAM_PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE", "HTML")
 DISABLE_LINK_PREVIEW = os.getenv("DISABLE_LINK_PREVIEW", "1") == "1"
 
-# 新增：更快流式刷新 & 输出净化
-STREAM_EDIT_INTERVAL_MS = int(os.getenv("STREAM_EDIT_INTERVAL_MS", "120"))  # 每次编辑最小间隔（毫秒）
-STREAM_MIN_DELTA_CHARS  = int(os.getenv("STREAM_MIN_DELTA_CHARS", "60"))    # 至少新增多少字符就刷新
-SANITIZE_OUTPUT         = os.getenv("SANITIZE_OUTPUT", "1") == "1"          # 是否清理星号/杂符
+# 输出净化（去星号/项目符号/重复标点，代码块除外）
+SANITIZE_OUTPUT   = os.getenv("SANITIZE_OUTPUT", "1") == "1"
 
 # ================== 常量与客户端 ==================
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# 强化：始终基于搜索结果回答
 SYSTEM_PROMPT = (
     "You are ChatGPT with real-time browsing ability.\n"
+    "Always answer based ONLY on the latest search notes provided below.\n"
     "Use plain sentences with simple punctuation. Do not use bullets, asterisks, Markdown, or emojis unless the user asks.\n"
-    "When search results are provided, rely on them and synthesize a concise answer.\n"
-    "Avoid decorative punctuation and excessive exclamation/question marks.\n"
+    "If the search notes are insufficient, say so briefly and keep the answer concise.\n"
     "Respond in the user's language."
 )
 
@@ -77,8 +78,9 @@ def _prune_old():
 def _build_messages(chat_id: int, user_id: int, user_text: str, search_block: Optional[str]) -> List[Dict[str, str]]:
     hist = [m for m in _get_history(chat_id, user_id) if time.time() - m.get("ts", 0) < HISTORY_LIFESPAN]
     messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if search_block:
-        messages.append({"role": "system", "content": f"Here are fresh search notes:\n{search_block}"})
+    # 总是把搜索结果作为系统补充（每次自动联网）
+    messages.append({"role": "system", "content": f"Here are the latest search notes:\n{search_block or 'No search results.'}"})
+    # 组装最近对话历史（控制字符数）
     total_chars = 0
     acc: List[Dict[str, str]] = []
     for m in reversed(hist):
@@ -122,10 +124,9 @@ def _sanitize_plain_text(text: str) -> str:
     # 避免破坏代码块
     if "```" in text:
         return text
-
-    # 行首项目符号（- • · * 等）
+    # 行首项目符号
     text = re.sub(r"(?m)^\s*[-–—"+_PUNCT_BULLETS+r"]\s+", "", text)
-    # 移除常见 Markdown 符号与项目符号字符
+    # 移除 Markdown 符号与项目符号字符
     text = re.sub(_MD_MARKS, "", text)
     text = re.sub(_PUNCT_BULLETS, "", text)
     # 统一引号
@@ -156,35 +157,32 @@ async def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = Non
     r.raise_for_status()
     return r.json()
 
-async def tg_edit_message(chat_id: int, message_id: int, text: str):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": TELEGRAM_PARSE_MODE,
-        "disable_web_page_preview": DISABLE_LINK_PREVIEW,
-    }
-    r = await client.post(f"{TELEGRAM_API}/editMessageText", json=payload)
-    r.raise_for_status()
-    return r.json()
-
 # ================== 搜索功能（SerpAPI） ==================
 def _format_search_results(data: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    返回 (用于塞给模型的纯文本 block, [(title, url)] 供可选脚注)
+    """
     results_txt_lines: List[str] = []
     footnotes: List[Tuple[str, str]] = []
 
     def add_item(title: str, snippet: str, link: str):
         if not title and not snippet:
             return
-        results_txt_lines.append(f"- {title or '(no title)'}: {snippet or ''} [{link}]")
+        # 用简单行文，不加花哨符号
+        line = f"{title or '(no title)'}: {snippet or ''} [{link}]".strip()
+        results_txt_lines.append(line)
         if title and link:
             footnotes.append((title, link))
 
+    # Organic
     for item in data.get("organic_results", [])[:5]:
         add_item(item.get("title", ""), item.get("snippet", ""), item.get("link", ""))
+
+    # News
     for item in data.get("news_results", [])[:3]:
         add_item(item.get("title", ""), item.get("snippet", ""), item.get("link", ""))
 
+    # Answer box
     abox = data.get("answer_box") or {}
     if abox:
         add_item(abox.get("title", "Answer"), abox.get("snippet", "") or abox.get("answer", ""), abox.get("link", ""))
@@ -193,7 +191,8 @@ def _format_search_results(data: Dict[str, Any]) -> Tuple[str, List[Tuple[str, s
 
 async def search_web(query: str) -> Tuple[str, List[Tuple[str, str]]]:
     if not SERPAPI_KEY:
-        return "Search disabled (SERPAPI_KEY not set).", []
+        # 强制联网搜索：未配置时给出明确提示
+        return "Search disabled (SERPAPI_KEY not set). Please set SERPAPI_KEY to enable live browsing.", []
     url = "https://serpapi.com/search"
     params = {"q": query, "hl": "zh-cn", "gl": "cn", "api_key": SERPAPI_KEY}
     try:
@@ -204,68 +203,40 @@ async def search_web(query: str) -> Tuple[str, List[Tuple[str, str]]]:
     except Exception as e:
         return f"Search error: {e}", []
 
-# ================== OpenAI 调用（含流式） ==================
-async def _chat_once(model: str, messages: List[Dict[str, str]], stream: bool = False):
+# ================== OpenAI 调用（非流式） ==================
+async def _chat_once(model: str, messages: List[Dict[str, str]]):
     url = f"{OPENAI_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    body = {"model": model, "messages": messages, "temperature": 0.7, "stream": stream}
+    body = {"model": model, "messages": messages, "temperature": 0.7}
 
     async with _openai_sema:
-        if not stream:
-            delay = 1.0
-            for _ in range(5):
-                try:
-                    resp = await client.post(url, headers=headers, json=body)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    return data["choices"][0]["message"]["content"]
-                except httpx.HTTPStatusError as e:
-                    status = e.response.status_code
-                    if status in (429, 503):
-                        ra = e.response.headers.get("retry-after")
-                        wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else delay
-                        await asyncio.sleep(wait); delay = min(delay * 2, 20.0); continue
-                    raise
-                except httpx.HTTPError:
-                    await asyncio.sleep(delay); delay = min(delay * 2, 20.0); continue
-            raise httpx.HTTPError("OpenAI 服务繁忙，请稍后再试")
-        else:
-            async def gen():
-                delay = 1.0
-                for attempt in range(5):
-                    try:
-                        async with client.stream("POST", url, headers=headers, json=body) as resp:
-                            resp.raise_for_status()
-                            async for line in resp.aiter_lines():
-                                if not line or not line.startswith("data: "):
-                                    continue
-                                data = line[6:]
-                                if data.strip() == "[DONE]":
-                                    return
-                                try:
-                                    j = json.loads(data)
-                                    delta = j["choices"][0]["delta"].get("content")
-                                    if delta:
-                                        yield delta
-                                except Exception:
-                                    continue
-                        return
-                    except httpx.HTTPStatusError as e:
-                        if e.response.status_code in (429, 503):
-                            ra = e.response.headers.get("retry-after")
-                            wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else delay
-                            await asyncio.sleep(wait); delay = min(delay * 2, 20.0); continue
-                        raise
-                    except httpx.HTTPError:
-                        await asyncio.sleep(delay); delay = min(delay * 2, 20.0); continue
-                return
-            return gen()
+        delay = 1.0
+        for _ in range(5):
+            try:
+                resp = await client.post(url, headers=headers, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status in (429, 503):
+                    ra = e.response.headers.get("retry-after")
+                    wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else delay
+                    await asyncio.sleep(wait)
+                    delay = min(delay * 2, 20.0)
+                    continue
+                raise
+            except httpx.HTTPError:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 20.0)
+                continue
+        raise httpx.HTTPError("OpenAI 服务繁忙，请稍后再试")
 
-async def openai_chat(messages: List[Dict[str, str]], use_stream: bool):
+async def openai_chat(messages: List[Dict[str, str]]):
     preferred = [OPENAI_MODEL, "gpt-4o", "gpt-4o-mini"]
     for model in preferred:
         try:
-            return await _chat_once(model, messages, stream=use_stream)
+            return await _chat_once(model, messages)
         except Exception:
             continue
     raise RuntimeError("OpenAI 调用失败")
@@ -275,13 +246,14 @@ def build_smart_query(text: str, hist: Deque[Dict[str, Any]]) -> str:
     text_strip = text.strip()
     if len(text_strip) >= 6:
         return text_strip
+    # 短语时结合上文
     last_user = next((m["content"] for m in reversed(hist) if m["role"] == "user"), "")
     return (last_user + " " + text_strip).strip() if last_user else text_strip
 
 def make_footnotes_html(footnotes: List[Tuple[str, str]]) -> str:
     if not footnotes:
         return ""
-    lines = ["\n\n<b>参考来源</b>"]
+    lines = ["\n\n参考来源"]
     used = set()
     idx = 1
     for title, url in footnotes:
@@ -296,7 +268,7 @@ def make_footnotes_html(footnotes: List[Tuple[str, str]]) -> str:
             break
     return "\n" + "\n".join(lines)
 
-async def answer_and_stream(chat_id: int, user_id: int, text: str, reply_to: Optional[int]):
+async def answer_once(chat_id: int, user_id: int, text: str, reply_to: Optional[int]):
     # 限流（每个用户）
     now = time.time()
     key = _conv_key(chat_id, user_id)
@@ -305,91 +277,25 @@ async def answer_and_stream(chat_id: int, user_id: int, text: str, reply_to: Opt
         return
     _last_call_ts[key] = now
 
-    # 搜索
+    # 每次都联网搜索
     hist = _get_history(chat_id, user_id)
     search_query = build_smart_query(text, hist)
     search_block, footnotes = await search_web(search_query)
 
-    # 组装消息
+    # 构造上下文并一次性生成
     messages = _build_messages(chat_id, user_id, text, search_block)
-
-    # 打字动作
-    await tg_send_chat_action(chat_id, "typing")
-
-    if STREAM_REPLY:
-        # 占位消息
-        placeholder = await tg_send_message(chat_id, "…", reply_to=reply_to)
-        message_id = placeholder["result"]["message_id"]
-
-        acc = ""
-        buf = ""  # 自上次编辑以来新增的内容
-        edit_interval = max(0.05, STREAM_EDIT_INTERVAL_MS / 1000.0)
-        min_delta = max(10, STREAM_MIN_DELTA_CHARS)
-        last_edit = time.monotonic()
-
-        try:
-            stream = await openai_chat(messages, use_stream=True)
-            async for delta in stream:
-                acc += delta
-                buf += delta
-                now_mono = time.monotonic()
-                if (now_mono - last_edit >= edit_interval) or (len(buf) >= min_delta):
-                    out = _sanitize_plain_text(acc) if SANITIZE_OUTPUT else acc
-                    body = make_safe_html(out)
-                    parts = telegram_split(body)
-
-                    if len(parts) > 1:
-                        await tg_edit_message(chat_id, message_id, parts[0])
-                        for mid in parts[1:-1]:
-                            sent = await tg_send_message(chat_id, mid)
-                            message_id = sent["result"]["message_id"]
-                        await tg_edit_message(chat_id, message_id, parts[-1])
-                    else:
-                        await tg_edit_message(chat_id, message_id, parts[0])
-
-                    last_edit = now_mono
-                    buf = ""
-
-            # 收尾（加脚注）
-            final_out = _sanitize_plain_text(acc) if SANITIZE_OUTPUT else acc
-            final_body = make_safe_html(final_out) + make_footnotes_html(footnotes)
-            final_parts = telegram_split(final_body)
-
-            await tg_edit_message(chat_id, message_id, final_parts[0])
-            for extra in final_parts[1:]:
-                await tg_send_message(chat_id, extra)
-
-            _append_history(chat_id, user_id, "user", text)
-            _append_history(chat_id, user_id, "assistant", acc)
-
-        except Exception as e:
-            # 降级为一次性完整回复
-            try:
-                reply_text = await openai_chat(messages, use_stream=False)
-                final_out = _sanitize_plain_text(reply_text) if SANITIZE_OUTPUT else reply_text
-                body = make_safe_html(final_out) + make_footnotes_html(footnotes)
-                parts = telegram_split(body)
-                await tg_edit_message(chat_id, message_id, parts[0])
-                for extra in parts[1:]:
-                    await tg_send_message(chat_id, extra)
-                _append_history(chat_id, user_id, "user", text)
-                _append_history(chat_id, user_id, "assistant", reply_text)
-            except Exception as e2:
-                await tg_edit_message(chat_id, message_id, f"❌ 错误: {escape_html(str(e2))}")
-    else:
-        # 非流式：一次性发送
-        try:
-            reply_text = await openai_chat(messages, use_stream=False)
-            final_out = _sanitize_plain_text(reply_text) if SANITIZE_OUTPUT else reply_text
-            body = make_safe_html(final_out) + make_footnotes_html(footnotes)
-            parts = telegram_split(body)
-            await tg_send_message(chat_id, parts[0], reply_to=reply_to)
-            for extra in parts[1:]:
-                await tg_send_message(chat_id, extra)
-            _append_history(chat_id, user_id, "user", text)
-            _append_history(chat_id, user_id, "assistant", reply_text)
-        except Exception as e:
-            await tg_send_message(chat_id, f"❌ 错误: {escape_html(str(e))}", reply_to=reply_to)
+    try:
+        reply_text = await openai_chat(messages)
+        final_out = _sanitize_plain_text(reply_text) if SANITIZE_OUTPUT else reply_text
+        body = make_safe_html(final_out) + make_footnotes_html(footnotes)
+        parts = telegram_split(body)
+        await tg_send_message(chat_id, parts[0], reply_to=reply_to)
+        for extra in parts[1:]:
+            await tg_send_message(chat_id, extra)
+        _append_history(chat_id, user_id, "user", text)
+        _append_history(chat_id, user_id, "assistant", reply_text)
+    except Exception as e:
+        await tg_send_message(chat_id, f"错误: {escape_html(str(e))}", reply_to=reply_to)
 
 # ================== FastAPI 路由 ==================
 app = FastAPI()
@@ -398,7 +304,7 @@ app = FastAPI()
 async def startup_event():
     async def background_tasks():
         while True:
-            await asyncio.sleep(43200)
+            await asyncio.sleep(3600)  # 每小时清一次过期上下文
             _prune_old()
     asyncio.create_task(background_tasks())
 
@@ -423,18 +329,14 @@ async def telegram_webhook(request: Request):
     message_id = msg.get("message_id")
 
     if not text:
-        await tg_send_message(chat_id, "我目前只支持文字消息～", reply_to=message_id)
+        await tg_send_message(chat_id, "我目前只支持文字消息", reply_to=message_id)
         return PlainTextResponse("ok")
 
     cmd = text.strip().lower()
     if cmd == "/start":
         tips = (
-            "已开启 ChatGPT 风格体验\n"
-            "实时联网搜索（自动判断是否需要）\n"
-            "流式输出（边生成边刷新）\n"
-            "48 小时上下文记忆，输入 /clear 可清空\n"
-            "HTML 渲染更清晰，自动分片避免 4096 限制\n"
-            "使用环境变量 STREAM_REPLY 控制是否开启流式"
+            "已开启：自动联网搜索 + 一次性完整回复 + 24小时上下文记忆\n"
+            "输入 /clear 可清空上下文"
         )
         await tg_send_message(chat_id, tips)
         return PlainTextResponse("ok")
@@ -444,6 +346,6 @@ async def telegram_webhook(request: Request):
         await tg_send_message(chat_id, "已清空你的上下文")
         return PlainTextResponse("ok")
 
-    # 主逻辑：回答并流式输出
-    await answer_and_stream(chat_id, user_id, text, reply_to=message_id)
+    # 主逻辑：每次联网 + 非流式一次性回复
+    await answer_once(chat_id, user_id, text, reply_to=message_id)
     return PlainTextResponse("ok")
