@@ -1,18 +1,43 @@
 services:
   - type: web
-    name: gpt-telegram-bot
+    name: tg-chatgpt-like
     env: python
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /healthz
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: OPENAI_MODEL
+        value: gpt-4o
+      - key: OPENAI_STT_MODEL
+        value: whisper-1
+      - key: OPENAI_TTS_MODEL
+        value: gpt-4o-mini-tts
+      - key: OPENAI_IMAGE_MODEL
+        value: gpt-image-1
       - key: SERPAPI_KEY
         sync: false
       - key: WEBHOOK_SECRET
-        value: mysecret123
+        value: dev-secret
+      - key: HISTORY_MAX_TURNS
+        value: "12"
+      - key: HISTORY_LIFESPAN_SEC
+        value: "86400"
+      - key: STRICT_MODEL
+        value: "1"
+      - key: TTS_REPLY
+        value: "0"
+      - key: SEARCH_HL
+        value: en
+      - key: SEARCH_GL
+        value: us
+      - key: SEARCH_GOOGLE_DOMAIN
+        value: google.com
+      - key: SEARCH_NUM
+        value: "10"
